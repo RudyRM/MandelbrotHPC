@@ -3,7 +3,6 @@
 
 namespace py = pybind11;
 
-// Versión C++ Bindings (Clase 5)
 py::array_t<int> compute_cpp(int height, int width, int max_iter) {
     auto result = py::array_t<int>({height, width});
     py::buffer_info buf = result.request();
