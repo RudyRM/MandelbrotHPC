@@ -3,13 +3,7 @@ import os
 import resource
 import numpy as np
 import multiprocessing as mp
-# NOTA: NO forzar 'spawn' en Linux. Con 'spawn' cada proceso hijo re-ejecuta
-# TODOS los imports de nivel superior de este archivo (jax, ray),
-# multiplicando por mp.cpu_count() la memoria usada y pudiendo colgar/crashear
-# el equipo. El 'fork' por defecto de Linux comparte memoria copy-on-write
-# con el proceso padre y es seguro aquí porque JAX está forzado a CPU.
 
-# Cargar módulos compilados locales (.so en Linux)
 try:
     import mandelbrot_cython
     import mandelbrot_cpp
@@ -21,43 +15,10 @@ import jax
 import jax.numpy as jnp
 import ray
 
-# Forzar a JAX a ejecutarse en CPU
 jax.config.update('jax_platform_name', 'cpu')
 
-# =====================================================================
-# MEDICIÓN: energía (RAPL), memoria (RSS) y tiempo de CPU
-# =====================================================================
-# NOTA sobre Ray chunked (removido): en la corrida anterior, Ray chunked con
-# CPU pinning explícito (os.sched_setaffinity) dio resultados ~5-8x peores
-# que Ray naive de forma consistente y reproducible, incluso tras: (1)
-# verificar que el mapeo núcleo físico -> CPU lógica era correcto vía
-# /sys/devices/system/cpu/cpu*/topology/thread_siblings_list, y (2) descartar
-# throttling térmico subiendo las pausas de enfriamiento de 5s a 30s sin
-# cambio en el resultado (25.4s vs 25.5s -- prácticamente idéntico, lo cual
-# es evidencia de una causa determinística y no térmica). La hipótesis más
-# plausible es contención con los propios procesos internos de Ray (raylet,
-# GCS, plasma store) que no estaban pineados y pudieron caer en las mismas
-# CPUs reservadas para cómputo. Se documenta esto como hallazgo de
-# discusión en el informe, pero se remueve del benchmark principal porque
-# no aporta una comparación válida de rendimiento -- Ray naive ya cumple el
-# rol de representar paralelismo distribuido en la comparativa.
 
 def read_rapl_energy_uj(rapl_path='/sys/class/powercap/intel-rapl:0/energy_uj'):
-    """
-    Lee el contador de energía RAPL (Running Average Power Limit, sólo
-    CPUs Intel) del dominio 'package' (paquete completo del procesador),
-    en microjulios acumulados desde que arrancó el contador.
-
-    Devuelve None si no está disponible: CPU no-Intel (AMD no expone RAPL
-    por esta misma vía; usa un mecanismo distinto vía msr), sin permisos de
-    lectura, o kernel sin soporte 'powercap'. En ese caso la energía se
-    reporta como N/A en vez de inventar un número.
-
-    Para habilitar en la mayoría de las distros si el archivo existe pero
-    da PermissionError:
-        sudo chmod -R a+r /sys/class/powercap/intel-rapl
-    (el permiso se resetea al reiniciar; no es una fijación permanente).
-    """
     try:
         with open(rapl_path) as f:
             return int(f.read().strip())
@@ -70,13 +31,6 @@ if not RAPL_AVAILABLE:
           "permisos, o sin soporte powercap). La columna de energía se "
           "reportará como N/A. Para intentar habilitarla: "
           "sudo chmod -R a+r /sys/class/powercap/intel-rapl\n")
-
-# NOTA sobre RAPL y overflow: el contador de energy_uj es un entero de 32
-# bits en algunas CPUs Intel y puede dar la vuelta (wrap-around) tras
-# consumir suficiente energía continua (en la práctica, tras decenas de
-# segundos a potencia alta). Cada medición individual de este benchmark
-# dura pocos segundos, así que el riesgo es bajo, pero igual se valida que
-# el delta no sea negativo antes de reportarlo (ver medir()).
 
 def medir(func, *args, **kwargs):
     """
@@ -108,12 +62,7 @@ def medir(func, *args, **kwargs):
     cpu_after = os.times()
     mem_after_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     energy_after = read_rapl_energy_uj()
-
-    # ru_maxrss es el RSS PICO acumulado del proceso desde que arrancó (no
-    # se resetea entre llamadas), por eso reportamos el valor absoluto tras
-    # la llamada (memoria pico acumulada hasta ahora) y también el delta
-    # respecto de antes de esta llamada específica (cuánto pico subió, si
-    # es que subió -- puede ser 0 si un paso anterior ya usó más memoria).
+    
     metrics = {
         'tiempo_s': elapsed,
         'mem_pico_total_mb': mem_after_kb / 1024.0,
@@ -130,8 +79,7 @@ def medir(func, *args, **kwargs):
             metrics['energia_j'] = delta_uj / 1_000_000.0
             metrics['potencia_prom_w'] = (metrics['energia_j'] / elapsed) if elapsed > 0 else None
         else:
-            # Overflow del contador RAPL detectado -- no reportar un
-            # negativo sin sentido.
+            #Overflow del contador RAPL detectado -- no reportar un
             metrics['energia_j'] = None
             metrics['potencia_prom_w'] = None
     else:
@@ -142,11 +90,6 @@ def medir(func, *args, **kwargs):
 
 
 def reportar(nombre, metrics, t_base=None):
-    """Imprime una línea de resultado uniforme para todos los métodos,
-    incluyendo tiempo, speedup, CPU total (proceso + hijos), memoria pico y
-    energía (si disponible). GPU no aplica en este benchmark: todos los
-    métodos, incluido JAX, están forzados a ejecutar en CPU
-    (jax_platform_name='cpu'); no hay ningún paso que use GPU."""
     cpu_propio = metrics['cpu_user_s'] + metrics['cpu_sys_s']
     cpu_hijos = metrics['cpu_children_user_s'] + metrics['cpu_children_sys_s']
     linea = f"{nombre:<28}: {metrics['tiempo_s']:.4f}s"
@@ -163,15 +106,13 @@ def reportar(nombre, metrics, t_base=None):
     print(linea)
 
 
-# Configuración del tamaño del problema
+#Configuración del tamaño del problema
 HEIGHT, WIDTH = 2000, 2000
 MAX_ITER = 150
 
 grid_base = np.zeros((HEIGHT, WIDTH), dtype=np.float64)
 
-# =====================================================================
-# 1. PROGRAMACIÓN NORMAL (Python Secuencial - Clase 2)
-# =====================================================================
+# Python Secuencial
 def compute_normal(height, width, max_iter):
     output = np.zeros((height, width), dtype=np.int32)
     for i in range(height):
@@ -191,9 +132,7 @@ def compute_normal(height, width, max_iter):
             output[i, j] = k
     return output
 
-# =====================================================================
-# 2. VECTORIZACIÓN (NumPy SIMD - Clase 3)
-# =====================================================================
+# VECTORIZACIÓN NumPy
 def compute_numpy(height, width, max_iter):
     y, x = np.ogrid[-1.5:1.5:complex(0, height), -2.0:1.0:complex(0, width)]
     c = x + 1j * y
@@ -206,9 +145,8 @@ def compute_numpy(height, width, max_iter):
         output[mask] = k
     return output
 
-# =====================================================================
-# 3. PARALELISMO CPU (Multiprocessing - Clase 6)
-# =====================================================================
+
+#3. PARALELISMO CPU Multiprocessing
 def _worker_row(args):
     i, width, max_iter = args
     row = np.zeros(width, dtype=np.int32)
@@ -237,9 +175,7 @@ def compute_multiprocessing(height, width, max_iter):
     pool.join()
     return np.array(rows)
 
-# =====================================================================
-# 4. COMPILACIÓN JIT (JAX - Clase 8)
-# =====================================================================
+#4. COMPILACIÓN JIT (JAX)
 @jax.jit
 def _jax_mandelbrot_kernel(c_re, c_im, max_iter):
     def cond_fn(state):
@@ -255,9 +191,9 @@ def _jax_mandelbrot_kernel(c_re, c_im, max_iter):
 
 compute_jax_vmap = jax.jit(jax.vmap(jax.vmap(_jax_mandelbrot_kernel, in_axes=(0, None, None)), in_axes=(None, 0, None)))
 
-# =====================================================================
-# 5. PARALELISMO DISTRIBUIDO (Ray - Multi-nodo / Cluster)
-# =====================================================================
+
+#5. PARALELISMO DISTRIBUIDO Ray
+
 @ray.remote
 def _ray_worker_row(i, width, max_iter, height):
     row = np.zeros(width, dtype=np.int32)
@@ -282,9 +218,8 @@ def compute_ray_naive(height, width, max_iter):
     rows = ray.get(futures)
     return np.array(rows)
 
-# =====================================================================
-# EJECUCIÓN DEL BENCHMARK
-# =====================================================================
+#Ejecucion Benchmark
+
 if __name__ == "__main__":
     try:
         ray.shutdown()
@@ -300,11 +235,6 @@ if __name__ == "__main__":
     )
 
     print(f"--- Iniciando Comparativa Mandelbrot ({HEIGHT}x{WIDTH}) en Ubuntu --- \n")
-    print(f"[DEBUG] mp.cpu_count() reporta: {mp.cpu_count()} núcleos lógicos")
-    print(f"[DEBUG] Ray ve estos recursos: {ray.cluster_resources()}")
-    print("[DEBUG] GPU: no aplica -- todos los métodos corren forzados a CPU "
-          "(jax_platform_name='cpu'); no hay ningún paso en este benchmark "
-          "que use GPU.\n")
 
     try:
         # [1] Python Normal
