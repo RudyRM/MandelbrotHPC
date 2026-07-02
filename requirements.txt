@@ -1,0 +1,5 @@
+numpy>=1.22.0
+cython>=3.0.0
+pybind11>=2.10.0
+ray>=2.9.0
+jax[cpu]>=0.4.0
